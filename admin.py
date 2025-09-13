@@ -2,7 +2,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 import sqlite3
 
-ADMIN_ID = 123456789  # 👈 O'zingizning Telegram ID ingizni qo'ying!
+ADMIN_ID = 7440949683  # 👈 O'zingizning Telegram ID ingizni qo'ying!
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
