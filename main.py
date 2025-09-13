@@ -115,7 +115,7 @@ async def enter_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "✍️ *Iltimos, rasm uchun matn kiriting:* \n\nMisol:\n`kuchuk, qorli yerda, Pixar uslubida`\n\nYoki o'zingizning xohishingizni yozing..."
     )
-    context.user_data['awaiting_prompt'] = True
+    context.user_data['awaiting_prompt'] = True  # 👈 BU QATORDAN O'CHIRIB TASHLAMANG!
 
 async def repeat_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -236,14 +236,16 @@ def main():
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
+    # CallbackQueryHandler lar — AVVAL!
     application.add_handler(CallbackQueryHandler(generate_menu, pattern="^generate$"))
     application.add_handler(CallbackQueryHandler(set_style, pattern=r"^style_"))
     application.add_handler(CallbackQueryHandler(repeat_last, pattern="^repeat_last$"))
-    application.add_handler(CallbackQueryHandler(enter_prompt, pattern="^enter_new_prompt$"))
+    application.add_handler(CallbackQueryHandler(enter_prompt, pattern="^enter_new_prompt$"))  # 👈 Tuzatildi!
     application.add_handler(CallbackQueryHandler(stats, pattern="^stats$"))
     application.add_handler(CallbackQueryHandler(admin, pattern="^admin$"))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
+
+    # MessageHandler — SO'NG!
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prompt))
 
     print("🚀 AI Image Studio Pro ishga tushirildi! ✨")
