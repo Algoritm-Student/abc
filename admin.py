@@ -1,6 +1,7 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 import sqlite3
+from database import get_stats
 
 ADMIN_ID = 7440949683  # 👈 O'zingizning Telegram ID ingizni qo'ying!
 
