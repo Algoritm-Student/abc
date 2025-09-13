@@ -1,26 +1,30 @@
 import logging
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler  # 👈 BU QATORNI QO'SHING!
 from PIL import Image
 import io
 import os
 from dotenv import load_dotenv
-from database import init_db, save_image, get_last_style, get_stats
-from admin import admin_panel
 
+# .env faylini yuklash
 load_dotenv()
 
+# Logging sozlamalari
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-HF_TOKEN = os.getenv("HF_TOKEN")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+# Hugging Face API sozlamalari (Faqat bepul model!)
+HF_TOKEN = os.getenv("HF_TOKEN")  # 👈 .env faylida saqlang!
+API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"  # ✅ Tuzatildi!
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
+# Telegram bot tokeni
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# Rasm generatsiya funksiyasi (retry + timeout)
 async def generate_image(prompt: str) -> bytes:
+    """Hugging Face API orqali rasm yaratadi"""
     payload = {"inputs": prompt}
     max_retries = 3
     for attempt in range(max_retries):
@@ -31,24 +35,26 @@ async def generate_image(prompt: str) -> bytes:
         except Exception as e:
             if attempt == max_retries - 1:
                 raise Exception(f"❌ Rasm yaratishda xato: {str(e)}")
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
+# /start komandasi
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🎨 Rasm yaratish", callback_data="generate")],
-        [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
-        [InlineKeyboardButton("👨‍💻 Admin Panel", callback_data="admin")]
+        [InlineKeyboardButton("💡 Yordam", callback_data="help")],
+        [InlineKeyboardButton("🌐 English", callback_data="lang_en")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "👋 *Salom! Men AI Image Studio Pro!* 🤖✨\n\n"
+        "👋 *Salom! Men AI Image Studioman!* 🤖✨\n\n"
         "Sizga chiroyli rasm yaratishga yordam beraman.\n\n"
         "👇 Quyidagi tugmalardan birini bosing:",
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
 
+# Inline menu: uslub tanlash
 async def generate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -74,6 +80,7 @@ async def generate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
+# Uslubni tanlash → prompt qo'shish
 async def set_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -89,69 +96,17 @@ async def set_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected_style = query.data
     context.user_data['selected_style'] = style_map.get(selected_style, "")
 
-    last_style, last_prompt = get_last_style(update.effective_user.id)
-    if last_style and last_prompt:
-        button_text = f"🔁 {last_style} uslubida '{last_prompt[:20]}...' qayta yaratish"
-        keyboard = [
-            [InlineKeyboardButton(button_text, callback_data="repeat_last")],
-            [InlineKeyboardButton("✏️ Yangi prompt kiriting", callback_data="enter_new_prompt")]
-        ]
-    else:
-        keyboard = [[InlineKeyboardButton("✏️ Yangi prompt kiriting", callback_data="enter_new_prompt")]]
-
-    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_to_main")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await query.edit_message_text(
-        "✏️ *Endi rasm uchun matn kiriting!*",
-        parse_mode='Markdown',
-        reply_markup=reply_markup
+        "✏️ *Endi rasm uchun matn kiriting!*\n\n"
+        "Masalan:\n"
+        "`kuchuk, qorli yerda, oq, kundalik hayot`\n"
+        "`O'zbekiston terma jamoasi, stadionda, 4K, realistik`\n\n"
+        "Yoki o'zingizning xohishingizni yozing...",
+        parse_mode='Markdown'
     )
+    context.user_data['awaiting_prompt'] = True
 
-async def enter_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    await query.edit_message_text(
-        "✍️ *Iltimos, rasm uchun matn kiriting:* \n\nMisol:\n`kuchuk, qorli yerda, Pixar uslubida`\n\nYoki o'zingizning xohishingizni yozing..."
-    )
-    context.user_data['awaiting_prompt'] = True  # 👈 BU QATORDAN O'CHIRIB TASHLAMANG!
-
-async def repeat_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    last_style, last_prompt = get_last_style(update.effective_user.id)
-    if not last_prompt:
-        await query.edit_message_text("❌ Hech qanday oldingi rasm topilmadi.")
-        return
-
-    style = context.user_data.get('selected_style', "")
-    if style:
-        prompt = f"{last_prompt}, {style}"
-    else:
-        prompt = last_prompt
-
-    await query.edit_message_text("⏳ *Rasm yaratilmoqda...* 🎨✨", parse_mode='Markdown')
-
-    try:
-        image_data = await generate_image(prompt)
-        image = Image.open(io.BytesIO(image_data))
-
-        bio = io.BytesIO()
-        image.save(bio, 'PNG')
-        bio.seek(0)
-
-        await query.message.reply_photo(
-            photo=bio,
-            caption=f"*🎨 Sizning so'rovingiz:* `{prompt}`\n\n✨ *AI Image Studio Pro tomonidan yaratildi*",
-            parse_mode='Markdown'
-        )
-
-        save_image(update.effective_user.id, update.effective_user.username, prompt, style)
-    except Exception as e:
-        await query.edit_message_text(f"❌ Xatolik: {str(e)}")
-
+# Matn qabul qilish
 async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('awaiting_prompt'):
         return
@@ -161,6 +116,7 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Iltimos, matn kiriting!")
         return
 
+    # Agar uslub tanlangan bo'lsa, unga qo'shish
     style = context.user_data.get('selected_style', "")
     if style:
         prompt = f"{prompt}, {style}"
@@ -177,78 +133,74 @@ async def handle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_photo(
             photo=bio,
-            caption=f"*🎨 Sizning so'rovingiz:* `{prompt}`\n\n✨ *AI Image Studio Pro tomonidan yaratildi*",
+            caption=f"*🎨 Sizning so'rovingiz:* `{prompt}`\n\n✨ *AI Image Studio tomonidan yaratildi*",
             parse_mode='Markdown'
         )
-
-        save_image(update.effective_user.id, update.effective_user.username, prompt, style)
     except Exception as e:
-        await update.message.reply_text(f"❌ Xatolik: {str(e)}")
+        await update.message.reply_text(f"❌ Xatolik: {str(e)}\n\nIltimos, keyinroq qayta urinib ko'ring.")
 
+    # Holatni tozalash
     context.user_data['awaiting_prompt'] = False
     context.user_data['selected_style'] = ""
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Yordam menyusi
+async def help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    stats = get_stats()
-    message = (
-        "📊 *Umumiy statistika*\n\n"
-        f"👥 Jami rasm generatsiyalari: `{stats['total']}`\n\n"
-        "🔝 Eng ko'p so'ralgan uslublar:\n"
+    await query.edit_message_text(
+        "*💡 Qanday ishlash kerak?*\n\n"
+        "1. 👉 *Rasm yaratish* tugmasini bosing\n"
+        "2. 🎨 *Uslubni* tanlang (realistik, anime va h.k.)\n"
+        "3. ✍️ *Matnni* kiriting (masalan: \"kuchuk, qorli yerda\")\n"
+        "4. 🖼️ AI rasmni yaratadi!\n\n"
+        "*Eslatma:* Agar rasm 10 soniyadan ortiq kutilsa — server sekin. Qayta urinib ko'ring.",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Asosiy menyu", callback_data="back_to_main")]])
     )
-    for style, count in stats['top_styles']:
-        message += f"   • {style}: `{count}`\n"
 
-    message += "\n🔝 Eng ko'p so'ralgan promptlar:\n"
-    for prompt, count in stats['top_prompts']:
-        message += f"   • `{prompt[:25]}...`: `{count}`\n"
-
-    await query.edit_message_text(message, parse_mode='Markdown')
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await admin_panel(update, context)
-
+# Asosiy menyuga qaytish
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     keyboard = [
         [InlineKeyboardButton("🎨 Rasm yaratish", callback_data="generate")],
-        [InlineKeyboardButton("📊 Statistika", callback_data="stats")],
-        [InlineKeyboardButton("👨‍💻 Admin Panel", callback_data="admin")]
+        [InlineKeyboardButton("💡 Yordam", callback_data="help")],
+        [InlineKeyboardButton("🌐 English", callback_data="lang_en")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.edit_message_text(
-        "👋 *Salom! Men AI Image Studio Pro!* 🤖✨\n\n"
+        "👋 *Salom! Men AI Image Studioman!* 🤖✨\n\n"
         "Sizga chiroyli rasm yaratishga yordam beraman.\n\n"
         "👇 Quyidagi tugmalardan birini bosing:",
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
 
+# Tilni o'zgartirish (inprogress)
+async def change_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🇺🇸 English mode coming soon...\n\nMa'lumotlar saqlandi. O'zbek tiliga qaytish uchun /start ni bosing.")
+
+# Asosiy dastur
 import asyncio
 
 def main():
-    init_db()  # Bazani yaratish
-
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # CallbackQueryHandler lar — AVVAL!
+    # Handlerlar
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(generate_menu, pattern="^generate$"))
-    application.add_handler(CallbackQueryHandler(set_style, pattern=r"^style_"))
-    application.add_handler(CallbackQueryHandler(repeat_last, pattern="^repeat_last$"))
-    application.add_handler(CallbackQueryHandler(enter_prompt, pattern="^enter_new_prompt$"))  # 👈 Tuzatildi!
-    application.add_handler(CallbackQueryHandler(stats, pattern="^stats$"))
-    application.add_handler(CallbackQueryHandler(admin, pattern="^admin$"))
+    application.add_handler(CallbackQueryHandler(help_menu, pattern="^help$"))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern="^back_to_main$"))
-
-    # MessageHandler — SO'NG!
+    application.add_handler(CallbackQueryHandler(set_style, pattern=r"^style_"))
+    application.add_handler(CallbackQueryHandler(change_language, pattern="^lang_en$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_prompt))
 
-    print("🚀 AI Image Studio Pro ishga tushirildi! ✨")
+    print("🚀 AI Image Studio ishga tushirildi! ✨")
     application.run_polling()
 
 if __name__ == '__main__':
