@@ -1,4 +1,4 @@
 python-telegram-bot==20.6
-requests
-Pillow
-python-dotenv
+requests==2.31.0
+deep-translator==1.11.4
+moviepy==1.0.3
