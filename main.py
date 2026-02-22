@@ -1,557 +1,325 @@
-# main.py
-"""
-Telegram bot with:
-- prompt translation (auto -> en)
-- Digen API call (text_to_image)
-- rate limit, ban/unban, admin panel
-- create 5s video from generated image (moviepy)
-- persistence via sqlite3
-"""
-
 import os
-import logging
 import asyncio
-import time
-import sqlite3
-import tempfile
-import requests
-import aiohttp
-from io import BytesIO
+import logging
+from dotenv import load_dotenv
 
-from deep_translator import GoogleTranslator
-from moviepy.editor import ImageClip
-
-from telegram import (
-    Update,
-    InputMediaPhoto,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputFile,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 
-# -------------------------
-# CONFIG / Logging
-# -------------------------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# -------------------- CONFIG --------------------
+load_dotenv()
 
-# Env vars (or set them in DB via admin panel)
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # set this before running
-DEFAULT_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # or set ADMIN_ID env
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+PAY_LINK = os.getenv("PAY_LINK", "https://t.me/send?start=IVNYB5t7LJhJ").strip()
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-# Digen defaults (placeholders) -> prefer storing in DB settings
-# DO NOT hardcode real secrets here
-DEFAULT_DIGEN_TOKEN = os.getenv("DIGEN_TOKEN", "")
-DEFAULT_DIGEN_SESSION = os.getenv("DIGEN_SESSION", "")
-DIGEN_URL = "https://api.digen.ai/v2/tools/text_to_image"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing in .env")
 
-# -------------------------
-# SQLITE persistence
-# -------------------------
-DB_PATH = "bot_data.db"
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("media-paywall-bot")
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # users: id, username, last_gen_ts
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            last_gen_ts REAL DEFAULT 0
-        )
-    """)
-    # logs: id autoinc, user_id, username, prompt, images (json string), ts
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            prompt TEXT,
-            images TEXT,
-            ts REAL
-        )
-    """)
-    # bans: user_id
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bans (
-            user_id INTEGER PRIMARY KEY
-        )
-    """)
-    # settings: key, value
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-def db_get_setting(key, default=None):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return row[0]
-    return default
+# -------------------- IN-MEMORY STATE (NO DB) --------------------
+# Approved users (premium enabled) - resets when bot restarts
+PREMIUM_USERS: set[int] = set()
+BANNED_USERS: set[int] = set()
 
-def db_set_setting(key, value):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, str(value)))
-    conn.commit()
-    conn.close()
+# Packages (editable in code; you can rename anytime)
+# You said you will change the names yourself — just edit here.
+PACKAGES = [
+    {"id": 1, "title": "Unlimited Access", "price": "90 USDT", "pay_link": PAY_LINK},
+    # add more if you want:
+    # {"id": 2, "title": "VIP Package", "price": "99000 UZS", "pay_link": PAY_LINK},
+]
 
-def add_user(user_id, username):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(user_id, username) VALUES(?, ?)", (user_id, username))
-    cur.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
-    conn.commit()
-    conn.close()
+DEMO_TEXT = """🎬 Demo Videos
 
-def set_last_gen(user_id, ts):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET last_gen_ts = ? WHERE user_id = ?", (ts, user_id))
-    conn.commit()
-    conn.close()
+🎬 Demo Video 1 (https://t.me/demo5video/2)
+🎬 Demo Video 2 (https://t.me/demo5video/3)
+🎬 Demo Video 3 (https://t.me/demo5video/4)
+🎬 Demo Video 4 (https://t.me/demo5video/5)
+🎬 Demo Video 5 (https://t.me/demo5video/6)
 
-def get_last_gen(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT last_gen_ts FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
+👆 Click any link above to watch demo videos
 
-def log_entry(user_id, username, prompt, images):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO logs(user_id, username, prompt, images, ts) VALUES(?, ?, ?, ?, ?)",
-                (user_id, username, prompt, ",".join(images), time.time()))
-    conn.commit()
-    conn.close()
+💰 Want unlimited access to all videos?
+Purchase a package now!
+"""
 
-def is_banned(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM bans WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row)
-
-def ban_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO bans(user_id) VALUES(?)", (user_id,))
-    conn.commit()
-    conn.close()
-
-def unban_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def get_stats():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    total_users = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM logs")
-    total_images = cur.fetchone()[0]
-    conn.close()
-    return {"users": total_users, "requests": total_images}
-
-# init db on import
-init_db()
-
-# default rate limit seconds
-DEFAULT_RATE_LIMIT = int(db_get_setting("rate_limit", "30"))
-
-# Admin management
-ADMIN_ID = int(db_get_setting("admin_id", str(DEFAULT_ADMIN_ID))) if DEFAULT_ADMIN_ID else DEFAULT_ADMIN_ID
-
-# -------------------------
-# Utilities
-# -------------------------
-def escape_markdown_v2(text: str) -> str:
-    """
-    Escape for MarkdownV2.
-    """
-    import re
-    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
-
-def translate_to_en(text: str) -> str:
-    try:
-        return GoogleTranslator(source='auto', target='en').translate(text)
-    except Exception as e:
-        logger.warning("Translate failed: %s", e)
-        return text
-
-async def async_download(session, url):
-    try:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.read()
-                return data
-    except Exception as e:
-        logger.error("Download error %s -> %s", url, e)
-    return None
-
-def get_digen_headers():
-    # prefer DB-stored values
-    token = db_get_setting("digen_token", DEFAULT_DIGEN_TOKEN) or ""
-    sessionid = db_get_setting("digen_session", DEFAULT_DIGEN_SESSION) or ""
-    headers = {
-        "accept": "application/json, text/plain, */*",
-        "content-type": "application/json",
-        "digen-language": "uz-US",
-        "digen-platform": "web",
-        "digen-token": token,
-        "digen-sessionid": sessionid,
-        "origin": "https://rm.digen.ai",
-        "referer": "https://rm.digen.ai/",
-    }
-    return headers
-
-# -------------------------
-# Digen API call (sync inside to_thread)
-# -------------------------
-def digen_request(prompt: str, width=512, height=512, batch_size=4):
-    headers = get_digen_headers()
-    payload = {
-        "prompt": prompt,
-        "image_size": f"{width}x{height}",
-        "width": width,
-        "height": height,
-        "lora_id": "",
-        "batch_size": batch_size,
-        "reference_images": [],
-        "strength": ""
-    }
-    try:
-        resp = requests.post(DIGEN_URL, headers=headers, json=payload, timeout=60)
-        logger.info("Digen status %s", resp.status_code)
-        return resp.status_code, resp.text, resp.json() if resp.status_code == 200 else None
-    except Exception as e:
-        logger.exception("Digen request failed: %s", e)
-        return None, str(e), None
-
-# -------------------------
-# Create 5s video from image bytes
-# -------------------------
-def image_bytes_to_video(image_bytes: bytes, out_path: str, duration: int =5):
-    # moviepy expects a filename or numpy array; we save to temp file
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_img:
-        tmp_img.write(image_bytes)
-        tmp_img.flush()
-        tmp_img_name = tmp_img.name
-
-    clip = ImageClip(tmp_img_name, duration=duration)
-    # write video file
-    clip.write_videofile(out_path, fps=24, verbose=False, logger=None)
-    clip.close()
-
-# -------------------------
-# Handlers
-# -------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    add_user(user.id, user.username or "N/A")
-    text = (
-        "👋 *Salom!* Men Digen AI botiman.\n\n"
-        "✍️ Istalgan prompt yuboring — men 4 ta rasm yarataman va birinchisidan 5s video yasab beraman.\n"
-        "Agar prompt o'zbekcha bo'lsa — men uni avtomatik ingliz tiliga tarjima qilaman.\n\n"
-        "Misol: `Futuristic cyberpunk city with neon lights`"
+# -------------------- UI --------------------
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎬 Demo Videos"), KeyboardButton(text="💰 Packages")],
+            [KeyboardButton(text="🔒 Get Videos (Premium)")],
+        ],
+        resize_keyboard=True
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
-# Admin panel show
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        return await update.message.reply_text("⛔ Siz admin emassiz.")
-    keyboard = [
-        [InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
-        [InlineKeyboardButton("📨 Broadcast (forward)", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("⏳ Limit sozlash", callback_data="admin_limit")],
-        [InlineKeyboardButton("🚫 Ban/Unban", callback_data="admin_ban")],
-        [InlineKeyboardButton("🔑 Token/Session", callback_data="admin_token")],
-    ]
-    await update.message.reply_text("⚙️ Admin panel", reply_markup=InlineKeyboardMarkup(keyboard))
+def packages_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for p in PACKAGES:
+        rows.append([InlineKeyboardButton(
+            text=f"{p['title']} — {p['price']}",
+            callback_data=f"pack:{p['id']}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# Callback handler for admin buttons and regen
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+def paywall_kb(package_id: int) -> InlineKeyboardMarkup:
+    pack = next((p for p in PACKAGES if p["id"] == package_id), PACKAGES[0])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Pay Now", url=pack["pay_link"])],
+        [InlineKeyboardButton(text="✅ I Paid", callback_data=f"paid:{package_id}")],
+        [InlineKeyboardButton(text="🎬 Demo Videos", callback_data="demo")],
+        [InlineKeyboardButton(text="⬅️ Menu", callback_data="menu")],
+    ])
 
-    # REGEN flow: regen|<prompt>
-    if data.startswith("regen|"):
-        _, old_prompt = data.split("|", 1)
-        await query.edit_message_text(f"♻️ Qayta generatsiya qilinmoqda...\n`{escape_markdown_v2(old_prompt)}`", parse_mode="MarkdownV2")
-        # create a fake update-like object: easiest is to call generate with same chat context
-        fake_message = query.message
-        class FakeMsg: pass
-        fake = FakeMsg()
-        fake.text = old_prompt
-        fake.chat_id = fake_message.chat_id
-        fake.from_user = query.from_user
-        fake.message = fake_message
-        # Instead of fabricating, call generate handler using actual Update: use update._replace ?
-        # Simpler: set context.user_data and call generate() with original update
-        # We'll directly call generate using the original update but override text in message object:
-        query.message.text = old_prompt
-        await generate(update, context)
+def premium_videos_kb() -> InlineKeyboardMarkup:
+    # Replace these with your real premium video links or delivery logic
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Premium Video 1", url="https://t.me/demo5video/2")],
+        [InlineKeyboardButton(text="🎬 Premium Video 2", url="https://t.me/demo5video/3")],
+        [InlineKeyboardButton(text="⬅️ Menu", callback_data="menu")],
+    ])
+
+# -------------------- HELPERS --------------------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def guard(message: Message) -> bool:
+    if not message.from_user:
+        return False
+    uid = message.from_user.id
+    if uid in BANNED_USERS:
+        await message.answer("🚫 You are banned from using this bot.")
+        return False
+    return True
+
+async def show_paywall(call: CallbackQuery | None, msg: Message | None, package_id: int = 1):
+    pack = next((p for p in PACKAGES if p["id"] == package_id), PACKAGES[0])
+    text = (
+        "🔒 Premium Required\n\n"
+        f"📦 Package: {pack['title']}\n"
+        f"💰 Price: {pack['price']}\n\n"
+        "1) Tap **Pay Now**\n"
+        "2) After payment, tap **I Paid**\n\n"
+        "⚠️ Until admin approval, the bot will keep returning you to this payment screen."
+    )
+    if call:
+        await call.message.edit_text(text, reply_markup=paywall_kb(package_id), parse_mode="Markdown")
+        await call.answer()
+    elif msg:
+        await msg.answer(text, reply_markup=paywall_kb(package_id), parse_mode="Markdown")
+
+# -------------------- USER FLOW --------------------
+@dp.message(CommandStart())
+async def start(message: Message):
+    if not await guard(message):
         return
+    await message.answer(
+        "Welcome! 👋\n\n"
+        "🎬 You can watch demo videos for free.\n"
+        "🔒 To get full access, purchase a package.",
+        reply_markup=main_menu()
+    )
 
-    # Admin callbacks
-    if data == "admin_stats":
-        stats = get_stats()
-        await query.edit_message_text(f"📊 Statistika:\n- Foydalanuvchilar: {stats['users']}\n- So‘rovlar (logs): {stats['requests']}")
+@dp.message(F.text == "🎬 Demo Videos")
+async def demo_btn(message: Message):
+    if not await guard(message):
         return
+    await message.answer(DEMO_TEXT, disable_web_page_preview=True, reply_markup=main_menu())
 
-    if data == "admin_broadcast":
-        # set admin state to expect next message as broadcast content
-        context.user_data['admin_action'] = 'broadcast'
-        await query.edit_message_text("✉️ Iltimos, yubormoqchi bo‘lgan xabaringizni hozirgi chatga yuboring (bot xabarni barcha foydalanuvchilarga *forward* qiladi).")
+@dp.message(F.text == "💰 Packages")
+async def packages_btn(message: Message):
+    if not await guard(message):
         return
+    await message.answer("Choose a package:", reply_markup=packages_kb())
 
-    if data == "admin_limit":
-        context.user_data['admin_action'] = 'set_limit'
-        await query.edit_message_text("⏳ Yangi limitni soniya ko‘rinishida yuboring (masalan: 30).")
+@dp.message(F.text == "🔒 Get Videos (Premium)")
+async def get_videos(message: Message):
+    if not await guard(message):
         return
-
-    if data == "admin_ban":
-        context.user_data['admin_action'] = 'ban_flow'
-        await query.edit_message_text("🚫 Ban/Unban:\nFoydalanuvchi ID sini yuboring (raqam).")
-        return
-
-    if data == "admin_token":
-        context.user_data['admin_action'] = 'set_token'
-        await query.edit_message_text("🔑 Digen tokenini yoki sessionni yuboring (format: token|session).")
-        return
-
-# Admin message processor
-async def admin_message_processor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        return
-    action = context.user_data.get('admin_action')
-    if not action:
-        return
-
-    text = update.message.text.strip()
-    if action == 'broadcast':
-        # fetch all user ids and forward the admin's message
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users")
-        rows = cur.fetchall()
-        conn.close()
-        count = 0
-        for (uid,) in rows:
-            try:
-                await context.bot.forward_message(chat_id=uid, from_chat_id=update.effective_chat.id, message_id=update.message.message_id)
-                count += 1
-            except Exception as e:
-                logger.warning("Broadcast to %s failed: %s", uid, e)
-        context.user_data.pop('admin_action', None)
-        await update.message.reply_text(f"✅ Forward tugadi. Jo‘natildi: {count}")
-        return
-
-    if action == 'set_limit':
-        try:
-            val = int(text)
-            db_set_setting("rate_limit", str(val))
-            context.user_data.pop('admin_action', None)
-            await update.message.reply_text(f"✅ Yangi rate limit saqlandi: {val} soniya.")
-        except:
-            await update.message.reply_text("❌ Iltimos, butun son kiriting.")
-        return
-
-    if action == 'ban_flow':
-        try:
-            uid = int(text)
-            if is_banned(uid):
-                unban_user(uid)
-                await update.message.reply_text(f"✅ User {uid} unban qilindi.")
-            else:
-                ban_user(uid)
-                await update.message.reply_text(f"✅ User {uid} ban qilindi.")
-            context.user_data.pop('admin_action', None)
-        except:
-            await update.message.reply_text("❌ Noto'g'ri ID format. Faqat raqam.")
-        return
-
-    if action == 'set_token':
-        # expecting "token|session" or just token
-        if '|' in text:
-            token, sessionid = text.split("|", 1)
-            db_set_setting("digen_token", token.strip())
-            db_set_setting("digen_session", sessionid.strip())
-            await update.message.reply_text("✅ Token va session saqlandi.")
-        else:
-            db_set_setting("digen_token", text.strip())
-            await update.message.reply_text("✅ Token saqlandi.")
-        context.user_data.pop('admin_action', None)
-        return
-
-# MAIN generate handler
-async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Check message presence
-    if not update.message or not update.message.text:
-        return
-
-    user = update.effective_user
-    add_user(user.id, user.username or "N/A")
-
-    # Ban check
-    if is_banned(user.id):
-        return await update.message.reply_text("🚫 Siz block qilingansiz.")
-
-    # Rate limit
-    rate_limit = int(db_get_setting("rate_limit", str(DEFAULT_RATE_LIMIT)))
-    last_ts = get_last_gen(user.id) or 0
-    now = time.time()
-    if now - last_ts < rate_limit:
-        wait = int(rate_limit - (now - last_ts))
-        return await update.message.reply_text(f"⏳ Iltimos yangi rasm generatsiya qilish uchun {wait} soniya kuting!")
-
-    orig_prompt = update.message.text.strip()
-    await update.message.reply_text("🔁 Prompt qabul qilindi. Tarjima qilinmoqda va rasm yaratilmoqda...")
-
-    # Translate to English
-    prompt_en = await asyncio.to_thread(translate_to_en, orig_prompt)
-
-    # Call Digen API in thread
-    status, text_resp, json_resp = await asyncio.to_thread(digen_request, prompt_en, 512, 512, 4)
-
-    if status != 200 or not json_resp:
-        await update.message.reply_text(f"❌ API xatolik: {status}\n{text_resp}")
-        return
-
-    # Try get image id. This depends on API shape; adapt if needed.
-    image_id = json_resp.get("data", {}).get("id") or json_resp.get("data", {}).get("task_id") or None
-    if not image_id:
-        # maybe API returned urls directly
-        images = json_resp.get("data", {}).get("images") or []
-        if images:
-            image_urls = images[:4]
-        else:
-            await update.message.reply_text("❌ Rasm ID yoki URL topilmadi API javobida.")
-            return
+    uid = message.from_user.id
+    if uid in PREMIUM_USERS:
+        await message.answer("✅ Premium active! Here are your videos:", reply_markup=premium_videos_kb())
     else:
-        # As in original: build urls by pattern
-        image_urls = [f"https://liveme-image.s3.amazonaws.com/{image_id}-{i}.jpeg" for i in range(4)]
+        await show_paywall(None, message, package_id=1)
 
-    # Download images async
-    downloaded = []
-    async with aiohttp.ClientSession() as session:
-        tasks = [asyncio.create_task(async_download(session, url)) for url in image_urls]
-        results = await asyncio.gather(*tasks)
-        for r in results:
-            if r:
-                downloaded.append(r)
+@dp.callback_query(F.data == "menu")
+async def cb_menu(call: CallbackQuery):
+    if not call.from_user:
+        return
+    if call.from_user.id in BANNED_USERS:
+        await call.answer("Banned", show_alert=True)
+        return
+    await call.message.edit_text("Menu:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Demo Videos", callback_data="demo")],
+        [InlineKeyboardButton(text="💰 Packages", callback_data="packages")],
+        [InlineKeyboardButton(text="🔒 Get Videos (Premium)", callback_data="premium")],
+    ]))
+    await call.answer()
 
-    if not downloaded:
-        await update.message.reply_text("❌ Rasm yuklashda xatolik bo'ldi.")
+@dp.callback_query(F.data == "demo")
+async def cb_demo(call: CallbackQuery):
+    if not call.from_user:
+        return
+    if call.from_user.id in BANNED_USERS:
+        await call.answer("Banned", show_alert=True)
+        return
+    await call.message.edit_text(DEMO_TEXT, disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Packages", callback_data="packages")],
+        [InlineKeyboardButton(text="⬅️ Menu", callback_data="menu")],
+    ]))
+    await call.answer()
+
+@dp.callback_query(F.data == "packages")
+async def cb_packages(call: CallbackQuery):
+    if not call.from_user:
+        return
+    if call.from_user.id in BANNED_USERS:
+        await call.answer("Banned", show_alert=True)
+        return
+    await call.message.edit_text("Choose a package:", reply_markup=packages_kb())
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("pack:"))
+async def cb_pack(call: CallbackQuery):
+    if not call.from_user:
+        return
+    uid = call.from_user.id
+    if uid in BANNED_USERS:
+        await call.answer("Banned", show_alert=True)
         return
 
-    # save logs
-    log_entry(user.id, user.username or "N/A", orig_prompt, image_urls)
+    package_id = int(call.data.split(":")[1])
+    await show_paywall(call, None, package_id=package_id)
 
-    # send media group (photos)
-    try:
-        media = [InputMediaPhoto(media=url) for url in image_urls]
-        await update.message.reply_media_group(media)
-    except Exception as e:
-        # fallback: send individually (or send downloaded bytes)
-        for idx, b in enumerate(downloaded):
-            try:
-                await update.message.reply_photo(photo=BytesIO(b), caption=f"Image {idx+1}")
-            except:
-                pass
+@dp.callback_query(F.data == "premium")
+async def cb_premium(call: CallbackQuery):
+    if not call.from_user:
+        return
+    uid = call.from_user.id
+    if uid in BANNED_USERS:
+        await call.answer("Banned", show_alert=True)
+        return
+    if uid in PREMIUM_USERS:
+        await call.message.edit_text("✅ Premium active! Here are your videos:", reply_markup=premium_videos_kb())
+        await call.answer()
+    else:
+        await show_paywall(call, None, package_id=1)
 
-    # send prompt info and regen button
-    safe_prompt = escape_markdown_v2(orig_prompt)
-    keyboard = [
-        [InlineKeyboardButton("♻️ Qayta generatsiya", callback_data=f"regen|{orig_prompt}")],
-    ]
-    await update.message.reply_text(f"🖌 Prompt: `{safe_prompt}`", parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(keyboard))
+@dp.callback_query(F.data.startswith("paid:"))
+async def cb_paid(call: CallbackQuery):
+    """
+    Infinite loop:
+    - If user is NOT premium yet, always show paywall again.
+    - Also notify admins each time (you can throttle later).
+    """
+    if not call.from_user:
+        return
+    uid = call.from_user.id
+    if uid in BANNED_USERS:
+        await call.answer("Banned", show_alert=True)
+        return
 
-    # Create 5s video from first downloaded image
-    try:
-        first_bytes = downloaded[0]
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_vid:
-            out_path = tmp_vid.name
-        # moviepy blocking -> run in thread
-        await asyncio.to_thread(image_bytes_to_video, first_bytes, out_path, 5)
-        # send video
-        with open(out_path, "rb") as f:
-            await update.message.reply_video(video=f, caption="▶️ 5s video (first image)")
-    except Exception as e:
-        logger.exception("Video creation failed: %s", e)
-        await update.message.reply_text("⚠️ Video yaratishda muammo bo'ldi (ffmpeg kerak bo'lishi mumkin).")
+    package_id = int(call.data.split(":")[1])
 
-    # update last gen time
-    set_last_gen(user.id, time.time())
+    # If already approved -> show premium videos
+    if uid in PREMIUM_USERS:
+        await call.message.edit_text("✅ Premium active! Here are your videos:", reply_markup=premium_videos_kb())
+        await call.answer()
+        return
 
-    # notify admin
-    admin_id = int(db_get_setting("admin_id", str(ADMIN_ID))) if ADMIN_ID else ADMIN_ID
-    if admin_id:
+    # Notify admins
+    pack = next((p for p in PACKAGES if p["id"] == package_id), PACKAGES[0])
+    for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(chat_id=admin_id, text=f"👤 @{user.username or 'N/A'} (ID: {user.id})\n🖌 {orig_prompt}")
-            # forward first image to admin if possible
-            # we will forward original message (if available)
-            try:
-                await context.bot.forward_message(chat_id=admin_id, from_chat_id=update.effective_chat.id, message_id=update.message.message_id)
-            except:
-                # fallback: send first image bytes
-                if downloaded:
-                    await context.bot.send_photo(chat_id=admin_id, photo=BytesIO(downloaded[0]))
+            await bot.send_message(
+                admin_id,
+                f"🧾 Payment claim\n"
+                f"User: {uid}\n"
+                f"Package: {pack['title']} ({pack['price']})\n\n"
+                f"Approve: /approve {uid}\n"
+                f"Reject: /ban {uid}  (optional)"
+            )
         except Exception as e:
-            logger.warning("Admin notify failed: %s", e)
+            log.warning(f"Admin notify failed: {admin_id} {e}")
 
-# Generic message handler to catch admin flows and normal generate
-async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # first check if admin is in action state
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
-        if context.user_data.get('admin_action'):
-            return await admin_message_processor(update, context)
-    # otherwise treat as prompt
-    return await generate(update, context)
+    # LOOP: show paywall again
+    await show_paywall(call, None, package_id=package_id)
 
-# -------------------------
-# Startup
-# -------------------------
-def main():
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN not set in env. Export BOT_TOKEN and restart.")
+# -------------------- ADMIN COMMANDS --------------------
+@dp.message(Command("approve"))
+async def cmd_approve(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
         return
-    # ensure admin id in settings
-    if DEFAULT_ADMIN_ID:
-        db_set_setting("admin_id", str(DEFAULT_ADMIN_ID))
-    app = Application.builder().token(BOT_TOKEN).build()
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Usage: /approve <user_id>")
+    uid = int(parts[1])
+    PREMIUM_USERS.add(uid)
+    BANNED_USERS.discard(uid)
+    await message.answer(f"✅ Approved user: {uid}")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    # message handler for admin flows and general prompts
+    # ping user
+    try:
+        await bot.send_message(uid, "✅ Your payment is approved! Premium access is now active.\nGo to: 🔒 Get Videos (Premium)")
+    except Exception:
+        pass
+
+@dp.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Usage: /revoke <user_id>")
+    uid = int(parts[1])
+    PREMIUM_USERS.discard(uid)
+    await message.answer(f"🗑 Premium revoked: {uid}")
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Usage: /ban <user_id>")
+    uid = int(parts[1])
+    BANNED_USERS.add(uid)
+    PREMIUM_USERS.discard(uid)
+    await message.answer(f"🚫 Banned user: {uid}")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Usage: /unban <user_id>")
+    uid = int(parts[1])
+    BANNED_USERS.discard(uid)
+    await message.answer(f"🔓 Unbanned user: {uid}")
+
+@dp.message(Command("admins"))
+async def cmd_admins(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await message.answer(f"Admins: {', '.join(map(str, sorted(ADMIN_IDS))) or '(none)'}")
+
+# -------------------- RUN --------------------
+async def main():
+    log.info("Starting bot...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
