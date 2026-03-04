@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Image</title>
+  <style>
+    body{margin:0;background:#0b0f14;color:#e7eef7;font-family:system-ui}
+    .top{position:sticky;top:0;background:#0b0f14cc;backdrop-filter:blur(10px);padding:12px;display:flex;gap:8px;align-items:center;border-bottom:1px solid #1c2633}
+    input{flex:1; padding:10px 12px; border-radius:10px; border:1px solid #223044; background:#0e141c; color:#e7eef7}
+    button{padding:10px 14px;border-radius:10px;border:1px solid #223044;background:#121b26;color:#e7eef7;cursor:pointer}
+    .hint{font-size:12px;opacity:.8}
+    iframe{width:100%;height:calc(100vh - 62px);border:0;display:block}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <input id="p" placeholder="Prompt yozing..." />
+    <button id="go">Ochish</button>
+  </div>
+  <div class="hint" style="padding:0 12px 10px 12px;">
+    Prompt URL orqali uzatiladi: <code>?prompt=...</code>. Iframe ichidagi saytdan rasmni avtomatik “parse” qilib bo‘lmaydi (cross-origin).
+  </div>
+
+  <iframe id="frame" src="https://null.perchance.org/pretty-ai"></iframe>
+
+  <script>
+    const inp = document.getElementById("p");
+    const btn = document.getElementById("go");
+    const frame = document.getElementById("frame");
+
+    // URL'dan promptni olish
+    const params = new URLSearchParams(location.search);
+    const qPrompt = params.get("prompt");
+    if (qPrompt) inp.value = qPrompt;
+
+    // "Ochish" bosilganda (siz xohlasangiz shu yerda new-tab ham qilasiz)
+    btn.onclick = () => {
+      const prompt = inp.value.trim();
+      const url = new URL(location.href);
+      if (prompt) url.searchParams.set("prompt", prompt);
+      history.replaceState({}, "", url.toString());
+
+      // Eslatma: iframe ichidagi Perchance generator promptni avtomatik qabul qilishi
+      // faqat siz generator ichida shunday logika yozgan bo'lsangiz ishlaydi.
+      // Aks holda user promptni iframe ichida yozadi.
+      frame.focus();
+    };
+  </script>
+</body>
+</html>
